@@ -1,7 +1,7 @@
-from .common.train import train
-from .common.model import model
-from .common.optimizer import optimizer
-from .common.scheduler import lr_multiplier
+from Matte_Anything.configs.common.train import train
+from Matte_Anything.configs.common.model import model
+from Matte_Anything.configs.common.optimizer import optimizer
+from Matte_Anything.configs.common.scheduler import lr_multiplier
 
 model.backbone.embed_dim = 768
 model.backbone.num_heads = 12

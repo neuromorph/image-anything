@@ -50,7 +50,7 @@ vitmatte_models = {
 }
 
 vitmatte_config = {
-	'vit_b': 'Matte-Anything/configs/matte_anything.py',
+	'vit_b': 'Matte_Anything/configs/matte_anything.py',
 }
 
 GR_PALETTE = (51, 255, 146)
@@ -207,7 +207,7 @@ def convert_pixels(gray_image, boxes):
 
     return converted_image
 
-def clear_old(ilist):
+def clear_old():
     return None
 
 
@@ -227,6 +227,8 @@ def run_grounded_sam(input_image, task_type, text_prompt, inpaint_prompt, bg_pro
     
     global blip_processor, blip_model, groundingdino_model, sam_predictor, sam_automask_generator, sd_pipeline, vitmatte, caption
     # anns, mask, alpha, vitmatte, new_bg_sample, new_bg_diffusion, inpaint = None, None, None, None, None, None, None
+    if caption == 'markdown':
+        caption = None
 
     # make dir
     os.makedirs(output_dir, exist_ok=True)
@@ -237,6 +239,7 @@ def run_grounded_sam(input_image, task_type, text_prompt, inpaint_prompt, bg_pro
     image_pil = image.convert("RGB")
     image = np.array(image_pil)
     # transformed_image = transform_image(image_pil)
+    
 
     if sam_predictor is None:
         # initialize SAM
@@ -254,45 +257,51 @@ def run_grounded_sam(input_image, task_type, text_prompt, inpaint_prompt, bg_pro
 
 
     if task_type == "Image Caption":
-        if caption is None:
+        print(f"Caption b4: {caption}")
+        # if caption is None:
             # generate caption and tags
             # use Tag2Text can generate better captions
             # https://huggingface.co/spaces/xinyu1205/Tag2Text
             # but there are some bugs...
-            blip_processor = blip_processor or BlipProcessor.from_pretrained("Salesforce/blip-image-captioning-large")
-            blip_model = blip_model or BlipForConditionalGeneration.from_pretrained("Salesforce/blip-image-captioning-large", torch_dtype=torch.float16).to("cuda")
-            caption = generate_caption(blip_processor, blip_model, image_pil)
+        blip_processor = blip_processor or BlipProcessor.from_pretrained("Salesforce/blip-image-captioning-large")
+        blip_model = blip_model or BlipForConditionalGeneration.from_pretrained("Salesforce/blip-image-captioning-large", torch_dtype=torch.float16).to("cuda")
+        caption = generate_caption(blip_processor, blip_model, image_pil)
             # caption = text_prompt
             # if len(openai_api_key) > 0:
             #     text_prompt = generate_tags(text_prompt, split=",", openai_api_key=openai_api_key)
-        print(f"Caption: {caption}")
+        print(f"Caption after: {caption}")
         return [caption, []]
 
     if task_type == "Auto SAM Mask":
         masks = sam_automask_generator.generate(image)
-        mask_image = Image.new('RGBA', size, color=(0, 0, 0, 0))
-        mask_draw = ImageDraw.Draw(mask_image)
-        for mask in masks:
-            draw_mask(mask[0].cpu().numpy(), mask_draw, random_color=True)
+        # mask_image = Image.new('RGBA', size, color=(0, 0, 0, 0))
+        # mask_draw = ImageDraw.Draw(mask_image)
+        # for mask in masks:
+        #     draw_mask(mask[0].cpu().numpy(), mask_draw, random_color=True)
 
-        image_pil = image_pil.convert('RGBA')
-        image_pil.alpha_composite(mask_image)
+        # image_pil = image_pil.convert('RGBA')
+        # image_pil.alpha_composite(mask_image)
+        # (image_pil, "Image with SAM Mask"), (mask_image, "SAM Mask"),
 
         full_img, res = show_anns(masks)
-        return [caption, [(image_pil, "Image with SAM Mask"), (mask_image, "SAM Mask"), (full_img, "show_anns fn full_img")]]
+        return [caption, [ (full_img, "show_anns fn full_img")]]
 
     if task_type == "Detection/Annotation/Segmentation" or task_type == "Inpainting" or task_type == "Remove/Replace Background":
         sam_predictor.set_image(image)
         point_coords, point_labels, transformed_boxes = None, None, None
+        print("scribble=======", np.max(scribble))
+        # return [caption, [(scribble, "Scribble")]]
+        scribble = scribble.convert("RGB")
+        scribble = np.array(scribble)
+        scribble = scribble.transpose(2, 1, 0)[0]
 
-        if scribble is not None:
-            scribble = scribble.convert("RGB")
-            scribble = np.array(scribble)
-            scribble = scribble.transpose(2, 1, 0)[0]
+        # User selected regions (circle/disk)
+        labeled_array, num_features = ndimage.label(scribble >= 255)
+        
+        print("num-features========== ", num_features)
 
-            # User selected regions (circle/disk)
-            labeled_array, num_features = ndimage.label(scribble >= 255)
-
+        if num_features > 0:
+            
             # Calculate centroid of regions
             centers = ndimage.center_of_mass(scribble, labeled_array, range(1, num_features+1))
             centers = np.array(centers)
@@ -348,8 +357,8 @@ def run_grounded_sam(input_image, task_type, text_prompt, inpaint_prompt, bg_pro
                 detections.xyxy = detections.xyxy[nms_idx]
                 detections.confidence = detections.confidence[nms_idx]
             
-            transformed_boxes = sam_predictor.transform.apply_boxes_torch(detections.xyxy, image.shape[:2]).to(device)
-
+            transformed_boxes = sam_predictor.transform.apply_boxes(detections.xyxy, image.shape[:2])
+            transformed_boxes = torch.as_tensor(transformed_boxes, dtype=torch.float).to(device)
 
         masks, _, _ = sam_predictor.predict_torch(
                 point_coords = point_coords,
@@ -359,10 +368,10 @@ def run_grounded_sam(input_image, task_type, text_prompt, inpaint_prompt, bg_pro
             )
 
         if task_type == "Detection/Annotation/Segmentation":
-            if scribble is None:
+            if num_features < 1:
                 image_draw = ImageDraw.Draw(image_pil)
 
-                for box, label in zip(boxes_filt, pred_phrases):
+                for box, label in zip(detections.xyxy, pred_phrases):
                     draw_box(box, image_draw, label)
 
             mask_image = Image.new('RGBA', size, color=(0, 0, 0, 0))
@@ -404,7 +413,7 @@ def run_grounded_sam(input_image, task_type, text_prompt, inpaint_prompt, bg_pro
         if task_type == "Remove/Replace Background":
 
             if vitmatte is None:
-                vitmatte = init_vitmatte('vit-b')
+                vitmatte = init_vitmatte('vit_b')
             masks = masks.cpu().detach().numpy()
             # mask_all = np.ones((image.shape[0], image.shape[1], 3))
             # for ann in masks:
@@ -546,13 +555,14 @@ if __name__ == "__main__":
         with gr.Row():
             with gr.Column():
                 input_image = gr.Image(source='upload', type="pil",  tool="sketch")
-
+                # image_caption = caption
                 gr.Markdown("<h3>Image Caption:</h3>")
-                caption = gr.Markdown()
-
+                img_caption = gr.Markdown()
+                # gr.Textbox(value= caption, label="Image Caption", interactive=False)
+                # gr.Markdown(caption)
                 gallery = gr.Gallery(
                     label="Generated Images", show_label=False, elem_id="gallery"
-                ).style(preview=True, grid=2, object_fit="contain", height="auto")
+                ).style(preview=True, object_fit="contain", height="auto")
                 
 
                 # with gr.Tab(label='Annotations'):
@@ -623,13 +633,13 @@ if __name__ == "__main__":
 
                     # with gr.Box():
 
-        input_image.upload(
-            clear_old,
-            [],
-            [caption]
-        )
+        # input_image.upload(
+        #     clear_old,
+        #     [],
+        #     [caption]
+        # )
         run_button.click(fn=run_grounded_sam, inputs=[input_image, task_type, text_prompt, inpaint_prompt, bg_prompt, scribble_mode, box_threshold, text_threshold, iou_threshold, 
-                                                      erode_kernel_size, dilate_kernel_size, tr_prompt, tr_box_threshold, tr_text_threshold, inpaint_mode, model_matte, model_sam], outputs=[caption, gallery])
+                                                      erode_kernel_size, dilate_kernel_size, tr_prompt, tr_box_threshold, tr_text_threshold, inpaint_mode, model_matte, model_sam], outputs=[img_caption, gallery])
 
     block.queue(concurrency_count=100)
     block.launch(server_name='0.0.0.0', server_port=args.port, debug=args.debug, share=args.share)
