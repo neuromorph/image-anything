@@ -127,8 +127,8 @@ def draw_box(box, draw, label):
     draw.rectangle(((box[0], box[1]), (box[2], box[3])), outline=color,  width=2)
 
     if label:
-        # font = ImageFont.load_default()
-        font = ImageFont.truetype("assets/OpenSans-Regular.ttf", 12)
+        font = ImageFont.load_default()
+        # font = ImageFont.truetype("assets/OpenSans-Regular.ttf", 50)
         if hasattr(font, "getbbox"):
             bbox = draw.textbbox((box[0], box[1]), str(label), font)
         else:
@@ -173,7 +173,7 @@ def clear_old():
 
 
 
-def run_grounded_sam(input_image, task_type, text_prompt, inpaint_prompt, bg_prompt, scribble_mode, box_threshold, text_threshold, iou_threshold, 
+def run_grounded_sam(input_image, task_type, text_prompt, inpaint_prompt, bg_prompt, negative_prompt, scribble_mode, box_threshold, text_threshold, iou_threshold, 
                                                       erode_kernel_size, dilate_kernel_size, tr_prompt, tr_box_threshold, tr_text_threshold, inpaint_mode, model_matte, model_sam):
     
     global blip_processor, blip_model, groundingdino_model, sam_predictor, sam_automask_generator, sd_inp_pipeline, sd_gen_pipeline, sd_ups_pipeline, vitmatte, caption
@@ -273,6 +273,8 @@ def run_grounded_sam(input_image, task_type, text_prompt, inpaint_prompt, bg_pro
 
                 detections.xyxy = detections.xyxy[nms_idx]
                 detections.confidence = detections.confidence[nms_idx]
+                pred_phrases = np.array(pred_phrases)
+                pred_phrases = pred_phrases[nms_idx]
             
             transformed_boxes = sam_predictor.transform.apply_boxes(detections.xyxy, image.shape[:2])
             transformed_boxes = torch.as_tensor(transformed_boxes, dtype=torch.float).to(device)
@@ -324,11 +326,12 @@ def run_grounded_sam(input_image, task_type, text_prompt, inpaint_prompt, bg_pro
                 sd_inp_pipeline = sd_inp_pipeline.to("cuda")
             
             inp_img = []
-            for i in range(masks_pil.shape[0]):
-                inp_img[i] = sd_inp_pipeline(prompt=inpaint_prompt, negative_prompt = negative_prompt, image=image_pil.resize((512, 512)), mask_image=masks_pil[i].resize((512, 512))).images[0]
-                inp_img[i] = inp_img[i].resize(size)
+            for i in range(len(masks_pil)):
+                img = sd_inp_pipeline(prompt=inpaint_prompt, negative_prompt = negative_prompt, image=image_pil.resize((512, 512)), mask_image=masks_pil[i].resize((512, 512))).images[0]
+                img = img.resize(size)
+                inp_img.append(img)
 
-            return [caption, [(inp_img[i], "Inpainting"), (masks_pil[i], "SAM Mask") for i in range(masks_pil.shape[0])]]
+            return [caption, [(inp_img[i], "Inpainting") for i in range(len(inp_img))] + [(masks_pil[i], "SAM Mask") for i in range(len(masks_pil))]]
 
 
         if task_type == "Remove/Replace Background":
@@ -465,7 +468,7 @@ if __name__ == "__main__":
 
             with gr.Column():        
                 task_type = gr.Dropdown(["Image Caption", "Auto SAM Mask", "Detection/Annotation/Segmentation", "Remove/Replace Background", "Inpainting", "Upscale", "Text-to-Image"], value="Detection/Annotation/Segmentation", label="Select Task")
-                gr.Markdown("Interaction Mode - Choose one: \n1. Click points on the image | \t2. Provide input text prompt | \t3. No interaction (default mode)")
+                gr.Markdown("Interaction Mode - Choose one: \n1. Click points on the image | \t2. Provide input text prompt | \t3. No interaction (auto mode)")
                 text_prompt = gr.Textbox(label="Input Text Prompt <For Detection, Inpaint source, Upscale or Text-to-Image")
                 inpaint_prompt = gr.Textbox(label="Inpaint Prompt <Inpaint target. Select Inpainting task>")
                 bg_prompt = gr.Textbox(label="Background Prompt <New SD background. Select Background Remove/Replace task >")
