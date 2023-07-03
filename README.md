@@ -1,5 +1,5 @@
 #  <center>Image Anything
-A gradio demo of image models. Refer to [colab notebook](image-anything.ipynb) for setup.
+A gradio demo of image models. Refer to [colab notebook](image_anything.ipynb) for setup.
 
 The project incorporates image generation and editing models in concert to perform various tasks.  
 
