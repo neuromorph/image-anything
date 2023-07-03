@@ -18,9 +18,9 @@ Models used:
 * Segment Anything (SAM)
 * Grounding DINO
 * Matte Anything (ViTMatte - Hust Labs)
-* Stable Diffusion 2
+* Stable Diffusion 2 (Hugging Face diffusers)
 * BLIP
-* Mobile SAM -> TBD
+* Mobile SAM
 * Matte Anything Model (MAM - SHI Labs) -> TBD  
 
 </br>

@@ -1,5 +1,6 @@
 import os
 import random
+import sys
 
 import gradio as gr
 import argparse
@@ -11,15 +12,14 @@ from torchvision.ops import box_convert
 from PIL import Image, ImageDraw, ImageFont
 from scipy import ndimage
 import cv2
-import sys
 
 # Grounding DINO
 sys.path.insert(0, './GroundingDINO')
 from groundingdino.util.inference import Model
-import groundingdino.datasets.transforms as T
 
 # segment anything
-from segment_anything import sam_model_registry, SamPredictor, SamAutomaticMaskGenerator
+from segment_anything import sam_model_registry as smr, SamPredictor as sp, SamAutomaticMaskGenerator as smg
+from mobile_sam import sam_model_registry as smr_mb, SamPredictor as sp_mb, SamAutomaticMaskGenerator as smg_mb
 import numpy as np
 
 # diffusers
@@ -35,24 +35,35 @@ from detectron2.checkpoint import DetectionCheckpointer
 
 GROUNDING_DINO_CONFIG_PATH = "GroundingDINO/groundingdino/config/GroundingDINO_SwinT_OGC.py"
 GROUNDING_DINO_CHECKPOINT_PATH = "./checkpoints/groundingdino_swint_ogc.pth"
-SAM_MODEL = 'vit_h'
-SAM_CHECKPOINT="./checkpoints/sam_vit_h_4b8939.pth"
-output_dir="outputs"
-device="cuda"
-
-vitmatte_models = {
-	'vit_b': './checkpoints/ViTMatte_B_DIS.pth',
-}
-
-vitmatte_config = {
-	'vit_b': 'Matte_Anything/configs/matte_anything.py',
-}
-
-GR_PALETTE = (51, 255, 146)
 
 SD_GEN_CHECKPOINT = "stabilityai/stable-diffusion-2-1-base"
 SD_INP_CHECKPOINT = "stabilityai/stable-diffusion-2-inpainting"
 SD_UPS_CHECKPOINT = "stabilityai/stable-diffusion-x4-upscaler"
+
+output_dir="outputs"
+device="cuda"
+
+sam_import = {
+	'SAM - Meta': {'sam_model_registry': smr, 'SamPredictor': sp, 'SamAutomaticMaskGenerator': smg},
+    'Mobile SAM': {'sam_model_registry': smr_mb, 'SamPredictor': sp_mb, 'SamAutomaticMaskGenerator': smg_mb} 
+}
+sam_config = {
+	'SAM - Meta': 'vit_h', 
+    'Mobile SAM': 'vit_t'  
+}
+sam_models = {
+	'vit_h': './checkpoints/sam_vit_h_4b8939.pth', # Meta SAM
+    'vit_t': './checkpoints/mobile_sam.pt'  # Mobile SAM
+}
+
+matte_config = {
+	'vit_b': 'Matte_Anything/configs/matte_anything.py'
+}
+matte_models = {
+	'vit_b': './checkpoints/ViTMatte_B_DIS.pth'
+}
+
+GR_PALETTE = (51, 255, 146)
 
 blip_processor = None
 blip_model = None
@@ -116,7 +127,8 @@ def draw_box(box, draw, label):
     draw.rectangle(((box[0], box[1]), (box[2], box[3])), outline=color,  width=2)
 
     if label:
-        font = ImageFont.load_default()
+        # font = ImageFont.load_default()
+        font = ImageFont.truetype("assets/OpenSans-Regular.ttf", 12)
         if hasattr(font, "getbbox"):
             bbox = draw.textbbox((box[0], box[1]), str(label), font)
         else:
@@ -128,14 +140,12 @@ def draw_box(box, draw, label):
         draw.text((box[0], box[1]), label)
 
 def init_vitmatte(model_type):
-
     #Initialize the vitmatte with model_type in ['vit_s', 'vit_b']
-
-    cfg = LazyConfig.load(vitmatte_config[model_type])
+    cfg = LazyConfig.load(matte_config[model_type])
     vitmatte = instantiate(cfg.model)
     vitmatte.to(device)
     vitmatte.eval()
-    DetectionCheckpointer(vitmatte).load(vitmatte_models[model_type])
+    DetectionCheckpointer(vitmatte).load(matte_models[model_type])
     return vitmatte
 
 def generate_trimap(mask, erode_kernel_size=10, dilate_kernel_size=10):
@@ -150,17 +160,15 @@ def generate_trimap(mask, erode_kernel_size=10, dilate_kernel_size=10):
 
 def convert_pixels(gray_image, boxes):
     converted_image = np.copy(gray_image)
-
     for box in boxes:
         x1, y1, x2, y2 = box
         x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
         converted_image[y1:y2, x1:x2][converted_image[y1:y2, x1:x2] == 1] = 0.5
-
     return converted_image
 
 def clear_old():
     global caption
-    caption = None
+    caption = None # Set caption to None on new image upload
     pass
 
 
@@ -181,34 +189,32 @@ def run_grounded_sam(input_image, task_type, text_prompt, inpaint_prompt, bg_pro
         image_pil = image.convert("RGB")
         image = np.array(image_pil)
     
-
+    # Initialize SAM
     if sam_predictor is None:
-        # initialize SAM
-        assert SAM_CHECKPOINT, 'SAM_CHECKPOINT is not found!'
-        sam = sam_model_registry[SAM_MODEL](checkpoint=SAM_CHECKPOINT)
+        model_type = sam_config[model_sam]
+        assert sam_models[model_type], 'SAM checkpoint is not found for the selected SAM model!'
+        sam = sam_import[model_sam]['sam_model_registry'][model_type](checkpoint=sam_models[model_type])
         sam.to(device=device)
         sam.eval()
-        sam_predictor = SamPredictor(sam)
-        sam_automask_generator = SamAutomaticMaskGenerator(sam)
+        sam_predictor = sam_import[model_sam]['SamPredictor'](sam)
+        sam_automask_generator = sam_import[model_sam]['SamAutomaticMaskGenerator'](sam)
 
+    # Initialize GroundingDINO
     if groundingdino_model is None:
         groundingdino_model = Model(model_config_path=GROUNDING_DINO_CONFIG_PATH, model_checkpoint_path=GROUNDING_DINO_CHECKPOINT_PATH, device=device)
 
 
     if task_type == "Image Caption":
-        print(f"Caption b4: {caption}")
         if caption is None:
             # generate caption and tags
-            # use Tag2Text can generate better captions
+            # use Tag2Text can generate better captions, but there are some bugs...
             # https://huggingface.co/spaces/xinyu1205/Tag2Text
-            # but there are some bugs...
             blip_processor = blip_processor or BlipProcessor.from_pretrained("Salesforce/blip-image-captioning-large")
             blip_model = blip_model or BlipForConditionalGeneration.from_pretrained("Salesforce/blip-image-captioning-large", torch_dtype=torch.float16).to("cuda")
             caption = generate_caption(blip_processor, blip_model, image_pil)
 
             # if len(openai_api_key) > 0:
             #     text_prompt = generate_tags(text_prompt, split=",", openai_api_key=openai_api_key)
-        print(f"Caption after: {caption}")
         return [caption, []]
 
     if task_type == "Auto SAM Mask":
@@ -227,8 +233,7 @@ def run_grounded_sam(input_image, task_type, text_prompt, inpaint_prompt, bg_pro
         labeled_array, num_features = ndimage.label(scribble >= 255)
         
 
-        if num_features > 0:
-            
+        if num_features > 0:          
             # Calculate centroid of regions
             centers = ndimage.center_of_mass(scribble, labeled_array, range(1, num_features+1))
             centers = np.array(centers)
@@ -298,24 +303,32 @@ def run_grounded_sam(input_image, task_type, text_prompt, inpaint_prompt, bg_pro
             
 
         if task_type == "Inpainting":
-            assert inpaint_prompt, 'inpaint_prompt is not found!'
-            
+            assert inpaint_prompt, "Inpaint_prompt is required!"
+            assert num_features > 0 or text_prompt, "Text prompt or Selected/scribble points required!"
+
             if inpaint_mode == 'merge':
-                masks = torch.sum(masks, dim=0).unsqueeze(0)
-                masks = torch.where(masks > 0, True, False)
-            mask = masks[0][0].cpu().numpy() # simply choose the first mask, which will be refine in the future release
-            mask_pil = Image.fromarray(mask)
+                masks_in = torch.sum(masks, dim=0)
+                masks_in = torch.where(masks_in > 0, True, False)
+                mask = masks_in[0].cpu().numpy() 
+                masks_pil = [Image.fromarray(mask)]
+            else: # inpaint_mode => 'split'
+                masks_in = torch.where(masks > 0, True, False)
+                masks_in = masks_in.cpu().numpy() 
+                masks_pil = [Image.fromarray(masks_in[i][0]) for i in range(masks_in.shape[0])]
+
             # inpainting pipeline
             if sd_inp_pipeline is None:
                 sd_inp_pipeline = StableDiffusionInpaintPipeline.from_pretrained(
                 SD_INP_CHECKPOINT, torch_dtype=torch.float16
                 )
                 sd_inp_pipeline = sd_inp_pipeline.to("cuda")
+            
+            inp_img = []
+            for i in range(masks_pil.shape[0]):
+                inp_img[i] = sd_inp_pipeline(prompt=inpaint_prompt, negative_prompt = negative_prompt, image=image_pil.resize((512, 512)), mask_image=masks_pil[i].resize((512, 512))).images[0]
+                inp_img[i] = inp_img[i].resize(size)
 
-            image = sd_inp_pipeline(prompt=inpaint_prompt, negative_prompt = negative_prompt, image=image_pil.resize((512, 512)), mask_image=mask_pil.resize((512, 512))).images[0]
-            image = image.resize(size)
-
-            return [caption, [(image, "Inpainting"), (mask_pil, "SAM Mask")]]
+            return [caption, [(inp_img[i], "Inpainting"), (masks_pil[i], "SAM Mask") for i in range(masks_pil.shape[0])]]
 
 
         if task_type == "Remove/Replace Background":
@@ -479,7 +492,7 @@ if __name__ == "__main__":
                     tr_text_threshold = gr.Slider(minimum=0.0, maximum=1.0, step=0.005, value=0.25, label="transparency text threshold")
 
                     gr.Markdown("Inpainting Settings")
-                    inpaint_mode = gr.Dropdown(["merge", "first"], value="merge", label="inpaint mode")
+                    inpaint_mode = gr.Dropdown(["merge", "split"], value="merge", label="inpaint mode")
 
                     gr.Markdown("Model Settings")
                     model_matte = gr.Radio(['ViTMatte (Matte Anything)', 'Matte Anything Model (MAM)'], value='ViTMatte (Matte Anything)', label='Alpha Matte Model')
