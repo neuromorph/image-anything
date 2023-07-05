@@ -1,5 +1,6 @@
 #  <center>Image Anything
-A gradio demo of image models. Refer to [colab notebook](image_anything.ipynb) for setup.
+A gradio demo of image models. Refer to [colab notebook](image_anything.ipynb) for setup.  
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/neuromorph/image-anything/blob/main/image-anything.ipynb)
 
 The project incorporates image generation and editing models in concert to perform various tasks.  
 
@@ -48,3 +49,12 @@ TBD:
 ![transp1](assets/transp1.png)
 ![transp2](assets/transp2.png)
 ![set1](assets/settings1.png) ![set2](assets/settings2.png)
+
+## Acknowledgements
+* [Grounded Segment Anything](https://github.com/IDEA-Research/Grounded-Segment-Anything) (inspiration and helpers)
+* [Segment Anything](https://github.com/facebookresearch/segment-anything/)
+* [GroundingDINO](https://github.com/IDEA-Research/GroundingDINO)
+* Stable Diffusion with [Hugging Face diffusers](https://github.com/huggingface/diffusers)
+* [Matte-Anything](https://github.com/hustvl/Matte-Anything)
+* [Mobile SAM](https://github.com/ChaoningZhang/MobileSAM)
+* [BLIP](https://arxiv.org/abs/2201.12086)
