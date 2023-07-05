@@ -1,6 +1,6 @@
 #  <center>Image Anything
 A gradio demo of image models. Refer to [colab notebook](image_anything.ipynb) for setup.  
-[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/neuromorph/image-anything/blob/main/image-anything.ipynb)
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/neuromorph/image-anything/blob/main/image_anything.ipynb)
 
 The project incorporates image generation and editing models in concert to perform various tasks.  
 
