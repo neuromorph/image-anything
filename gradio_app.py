@@ -24,7 +24,7 @@ import numpy as np
 
 # diffusers
 import torch
-from diffusers import StableDiffusionInpaintPipeline, StableDiffusionPipeline, StableDiffusionUpscalePipeline
+from diffusers import StableDiffusionInpaintPipeline, StableDiffusionPipeline, StableDiffusionUpscalePipeline, StableDiffusionImg2ImgPipeline, DPMSolverMultistepScheduler
 
 # BLIP
 from transformers import BlipProcessor, BlipForConditionalGeneration
@@ -33,12 +33,24 @@ from transformers import BlipProcessor, BlipForConditionalGeneration
 from detectron2.config import LazyConfig, instantiate
 from detectron2.checkpoint import DetectionCheckpointer
 
+# Controlnet Drawing Scribble
+from controlnet_aux import PidiNetDetector, HEDdetector
+from diffusers import (
+    ControlNetModel,
+    StableDiffusionControlNetPipeline,
+    UniPCMultistepScheduler,
+)
+
+
 GROUNDING_DINO_CONFIG_PATH = "GroundingDINO/groundingdino/config/GroundingDINO_SwinT_OGC.py"
 GROUNDING_DINO_CHECKPOINT_PATH = "./checkpoints/groundingdino_swint_ogc.pth"
 
 SD_GEN_CHECKPOINT = "stabilityai/stable-diffusion-2-1-base"
 SD_INP_CHECKPOINT = "stabilityai/stable-diffusion-2-inpainting"
 SD_UPS_CHECKPOINT = "stabilityai/stable-diffusion-x4-upscaler"
+SD_I2I_CHECKPOINT = "stabilityai/stable-diffusion-2-1-base"
+SD_CNTRLNET_CKP = "runwayml/stable-diffusion-v1-5"
+CONTROLNET_SCRIB_CKP = "lllyasviel/control_v11p_sd15_scribble"
 
 output_dir="outputs"
 device="cuda"
@@ -73,8 +85,19 @@ sam_automask_generator = None
 sd_inp_pipeline = None
 sd_gen_pipeline = None
 sd_ups_pipeline = None
+sd_cn_pipeline = None
+sd_i2i_pipeline = None
 vitmatte = None
 caption = None
+
+sd_kwargs = {
+    'torch_dtype':torch.float16,
+    # 'safety_checker':None,
+    # 'feature_extractor':None,
+    # 'requires_safety_checker':False
+}
+attn_slicing = True # enable_attention_slicing
+DPM_scheduler = True # use DPMSolver Multistep Scheduler
 
 
 def show_anns(anns):
@@ -171,12 +194,18 @@ def clear_old():
     caption = None # Set caption to None on new image upload
     pass
 
+def create_canvas():
+    return np.zeros(shape=(1000, 1000, 3), dtype=np.uint8) + 255
 
 
-def run_grounded_sam(input_image, task_type, text_prompt, inpaint_prompt, bg_prompt, negative_prompt, scribble_mode, box_threshold, text_threshold, iou_threshold, 
-                                                      erode_kernel_size, dilate_kernel_size, tr_prompt, tr_box_threshold, tr_text_threshold, inpaint_mode, model_matte, model_sam):
+def run_grounded_sam(input_image, task_type, text_prompt, sd_prompt, negative_prompt, scribble_mode, box_threshold, text_threshold, iou_threshold, 
+                                                      erode_kernel_size, dilate_kernel_size, tr_prompt, tr_box_threshold, tr_text_threshold, inpaint_mode, 
+                                                      model_matte, model_sam, guidance_scale, strength, num_inference_steps):
     
-    global blip_processor, blip_model, groundingdino_model, sam_predictor, sam_automask_generator, sd_inp_pipeline, sd_gen_pipeline, sd_ups_pipeline, vitmatte, caption
+    global blip_processor, blip_model, groundingdino_model, sam_predictor, sam_automask_generator, sd_inp_pipeline, sd_gen_pipeline, \
+    sd_ups_pipeline, sd_cn_pipeline, sd_i2i_pipeline, sd_kwargs, attn_slicing, DPM_scheduler, vitmatte, caption
+
+    torch.cuda.empty_cache()
 
     # make dir
     os.makedirs(output_dir, exist_ok=True)
@@ -206,15 +235,10 @@ def run_grounded_sam(input_image, task_type, text_prompt, inpaint_prompt, bg_pro
 
     if task_type == "Image Caption":
         if caption is None:
-            # generate caption and tags
-            # use Tag2Text can generate better captions, but there are some bugs...
-            # https://huggingface.co/spaces/xinyu1205/Tag2Text
+            # generate caption 
             blip_processor = blip_processor or BlipProcessor.from_pretrained("Salesforce/blip-image-captioning-large")
             blip_model = blip_model or BlipForConditionalGeneration.from_pretrained("Salesforce/blip-image-captioning-large", torch_dtype=torch.float16).to("cuda")
             caption = generate_caption(blip_processor, blip_model, image_pil)
-
-            # if len(openai_api_key) > 0:
-            #     text_prompt = generate_tags(text_prompt, split=",", openai_api_key=openai_api_key)
         return [caption, []]
 
     if task_type == "Auto SAM Mask":
@@ -229,7 +253,7 @@ def run_grounded_sam(input_image, task_type, text_prompt, inpaint_prompt, bg_pro
         scribble = scribble.convert("RGB")
         scribble = np.array(scribble)
         scribble = scribble.transpose(2, 1, 0)[0]
-        # User selected regions (circle/disk)
+        # User selected regions (scribble)
         labeled_array, num_features = ndimage.label(scribble >= 255)
         
 
@@ -246,36 +270,37 @@ def run_grounded_sam(input_image, task_type, text_prompt, inpaint_prompt, bg_pro
                 point_coords = point_coords.permute(1, 0, 2)
                 point_labels = point_labels.permute(1, 0)
 
-        else:
-            if text_prompt == "" or text_prompt is None:
-                if caption == "" or caption is None:
-                    blip_processor = blip_processor or BlipProcessor.from_pretrained("Salesforce/blip-image-captioning-large")
-                    blip_model = blip_model or BlipForConditionalGeneration.from_pretrained("Salesforce/blip-image-captioning-large", torch_dtype=torch.float16).to("cuda")
-                    caption = generate_caption(blip_processor, blip_model, image_pil)
+        # get text prompt for grounding dino
+        if text_prompt == "" or text_prompt is None:
+            if caption == "" or caption is None:
+                blip_processor = blip_processor or BlipProcessor.from_pretrained("Salesforce/blip-image-captioning-large")
+                blip_model = blip_model or BlipForConditionalGeneration.from_pretrained("Salesforce/blip-image-captioning-large", torch_dtype=torch.float16).to("cuda")
+                caption = generate_caption(blip_processor, blip_model, image_pil)
 
-                text_prompt = caption
-            
-            # run grounding dino model
-            detections, pred_phrases = groundingdino_model.predict_with_caption(
-                image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR), 
-                caption = text_prompt, 
-                box_threshold = box_threshold, 
-                text_threshold = text_threshold
-            )
+            text_prompt = caption
+        
+        # run grounding dino model
+        detections, pred_phrases = groundingdino_model.predict_with_caption(
+            image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR), 
+            caption = text_prompt, 
+            box_threshold = box_threshold, 
+            text_threshold = text_threshold
+        )
 
-            # use NMS to handle overlapped boxes
-            if len(detections.xyxy) > 1:
-                nms_idx = torchvision.ops.nms(
-                    torch.from_numpy(detections.xyxy), 
-                    torch.from_numpy(detections.confidence), 
-                    iou_threshold,
-                ).numpy().tolist()
+        # use NMS to handle overlapped boxes
+        if len(detections.xyxy) > 1:
+            nms_idx = torchvision.ops.nms(
+                torch.from_numpy(detections.xyxy), 
+                torch.from_numpy(detections.confidence), 
+                iou_threshold,
+            ).numpy().tolist()
 
-                detections.xyxy = detections.xyxy[nms_idx]
-                detections.confidence = detections.confidence[nms_idx]
-                pred_phrases = np.array(pred_phrases)
-                pred_phrases = pred_phrases[nms_idx]
-            
+            detections.xyxy = detections.xyxy[nms_idx]
+            detections.confidence = detections.confidence[nms_idx]
+            pred_phrases = np.array(pred_phrases)
+            pred_phrases = pred_phrases[nms_idx]
+        
+        if num_features < 1:
             transformed_boxes = sam_predictor.transform.apply_boxes(detections.xyxy, image.shape[:2])
             transformed_boxes = torch.as_tensor(transformed_boxes, dtype=torch.float).to(device)
 
@@ -287,10 +312,17 @@ def run_grounded_sam(input_image, task_type, text_prompt, inpaint_prompt, bg_pro
             )
 
         if task_type == "Detection/Annotation/Segmentation":
-            if num_features < 1:
-                image_draw = ImageDraw.Draw(image_pil)
-
-                for box, label in zip(detections.xyxy, pred_phrases):
+            image_draw = ImageDraw.Draw(image_pil)
+            boxdraw = True
+            for box, label in zip(detections.xyxy, pred_phrases):               
+                if num_features > 0:
+                    boxdraw = False
+                    # if any scribble point is inside box, draw that box
+                    for c in centers:
+                        if  c[0] >= box[0] and c[0] <= box[2] and c[1] >= box[1] and c[1] <= box[3]:
+                            boxdraw = True
+                            break
+                if boxdraw:
                     draw_box(box, image_draw, label)
 
             mask_image = Image.new('RGBA', size, color=(0, 0, 0, 0))
@@ -305,29 +337,36 @@ def run_grounded_sam(input_image, task_type, text_prompt, inpaint_prompt, bg_pro
             
 
         if task_type == "Inpainting":
-            assert inpaint_prompt, "Inpaint_prompt is required!"
-            assert num_features > 0 or text_prompt, "Text prompt or Selected/scribble points required!"
+            # assert sd_prompt, "Inpaint_prompt is required!"
+            # assert num_features > 0 or text_prompt, "Text prompt or Selected/scribble points required!"
 
             if inpaint_mode == 'merge':
                 masks_in = torch.sum(masks, dim=0)
                 masks_in = torch.where(masks_in > 0, True, False)
-                mask = masks_in[0].cpu().numpy() 
+                mask = masks_in[0].cpu().numpy()
+                # struct2 = ndimage.generate_binary_structure(2, 2)
+                # mask_dilated = ndimage.binary_dilation(mask, structure=struct2, iterations=3).astype(mask.dtype)
                 masks_pil = [Image.fromarray(mask)]
             else: # inpaint_mode => 'split'
                 masks_in = torch.where(masks > 0, True, False)
                 masks_in = masks_in.cpu().numpy() 
+                # struct2 = ndimage.generate_binary_structure(2, 2)
+                # masks_dilated = [ndimage.binary_dilation(masks_in[i][0], structure=struct2, iterations=3).astype(masks_in[i][0].dtype) for i in range(masks_in.shape[0])]
+                # masks_pil = [Image.fromarray(masks_dilated[i]) for i in range(len(masks_dilated))]
                 masks_pil = [Image.fromarray(masks_in[i][0]) for i in range(masks_in.shape[0])]
 
             # inpainting pipeline
             if sd_inp_pipeline is None:
                 sd_inp_pipeline = StableDiffusionInpaintPipeline.from_pretrained(
-                SD_INP_CHECKPOINT, torch_dtype=torch.float16
+                SD_INP_CHECKPOINT, **sd_kwargs
                 )
                 sd_inp_pipeline = sd_inp_pipeline.to("cuda")
+                if DPM_scheduler: sd_inp_pipeline.scheduler = DPMSolverMultistepScheduler.from_config(sd_inp_pipeline.scheduler.config)
+                if attn_slicing: sd_inp_pipeline.enable_attention_slicing()
             
             inp_img = []
             for i in range(len(masks_pil)):
-                img = sd_inp_pipeline(prompt=inpaint_prompt, negative_prompt = negative_prompt, image=image_pil.resize((512, 512)), mask_image=masks_pil[i].resize((512, 512))).images[0]
+                img = sd_inp_pipeline(prompt=sd_prompt, negative_prompt=negative_prompt, image=image_pil.resize((512, 512)), mask_image=masks_pil[i].resize((512, 512)), num_inference_steps=num_inference_steps, guidance_scale=guidance_scale, strength=strength).images[0]
                 img = img.resize(size)
                 inp_img.append(img)
 
@@ -353,7 +392,7 @@ def run_grounded_sam(input_image, task_type, text_prompt, inpaint_prompt, bg_pro
             trimap[trimap==128] = 0.5
             trimap[trimap==255] = 1
 
-            # run grounding dino model
+            # run grounding dino model for transparency
             boxes, phrases = groundingdino_model.predict_with_caption(
                 image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR), 
                 caption = tr_prompt, 
@@ -397,12 +436,18 @@ def run_grounded_sam(input_image, task_type, text_prompt, inpaint_prompt, bg_pro
             # use alpha blending
             new_bg_1 = image * np.expand_dims(alpha, axis=2).repeat(3,2)/255 + background_1 * (1 - np.expand_dims(alpha, axis=2).repeat(3,2))/255
 
-            if (bg_prompt is not None and bg_prompt != ""):
+            if (sd_prompt is not None and sd_prompt != ""):
                 if sd_gen_pipeline is None:
-                    sd_gen_pipeline = StableDiffusionPipeline.from_pretrained(SD_GEN_CHECKPOINT, torch_dtype=torch.float16)
+                    if sd_i2i_pipeline is not None:
+                        sd_gen_pipeline = StableDiffusionPipeline.from_pretrained(**sd_i2i_pipeline.components)
+                    else:
+                        sd_gen_pipeline = StableDiffusionPipeline.from_pretrained(SD_GEN_CHECKPOINT, **sd_kwargs)
+                
                     sd_gen_pipeline = sd_gen_pipeline.to("cuda")
+                    if DPM_scheduler: sd_gen_pipeline.scheduler = DPMSolverMultistepScheduler.from_config(sd_gen_pipeline.scheduler.config)
+                    if attn_slicing: sd_gen_pipeline.enable_attention_slicing()
 
-                background_img = sd_gen_pipeline(prompt = bg_prompt, negative_prompt = negative_prompt).images[0]
+                background_img = sd_gen_pipeline(prompt = sd_prompt, negative_prompt = negative_prompt,  guidance_scale=guidance_scale, num_inference_steps=num_inference_steps).images[0]
                 background_img = np.array(background_img)
                 background_img = cv2.resize(background_img, (image.shape[1], image.shape[0]))
                 new_bg_sd = image * np.expand_dims(alpha, axis=2).repeat(3,2)/255 + background_img * (1 - np.expand_dims(alpha, axis=2).repeat(3,2))/255
@@ -411,26 +456,67 @@ def run_grounded_sam(input_image, task_type, text_prompt, inpaint_prompt, bg_pro
                 return [caption, [(mask, "SAM Mask"), (alpha, "Alpha Mask"), (foreground_alpha, "Foreground Alpha"), (new_bg_1, "New Sample Background")]]
 
     if task_type == "Upscale":
-        assert text_prompt, "Text prompt for image is required to Upscale! "
+        # assert text_prompt, "Text prompt for image is required to Upscale! "
         if sd_ups_pipeline is None:
             # load model and scheduler
             sd_ups_pipeline = StableDiffusionUpscalePipeline.from_pretrained(
-                SD_UPS_CHECKPOINT, revision="fp16", torch_dtype=torch.float16
+                SD_UPS_CHECKPOINT, revision="fp16", **sd_kwargs
             )
             sd_ups_pipeline = sd_ups_pipeline.to("cuda")
-        ups_img = sd_ups_pipeline(prompt=text_prompt, negative_prompt=negative_prompt, image=image_pil).images[0]
+            if DPM_scheduler: sd_ups_pipeline.scheduler = DPMSolverMultistepScheduler.from_config(sd_ups_pipeline.scheduler.config)
+            if attn_slicing: sd_ups_pipeline.enable_attention_slicing()
+        
+        ups_img = sd_ups_pipeline(prompt=sd_prompt, negative_prompt=negative_prompt, image=image_pil, guidance_scale=guidance_scale, num_inference_steps=num_inference_steps).images[0]
         return [caption, [(ups_img, "Stable Diffusion Upscaled Image")]]
     
 
     if task_type == "Text-to-Image":
         assert text_prompt, "Text prompt is required for Text-to-Image! "
         if sd_gen_pipeline is None:
-            sd_gen_pipeline = StableDiffusionPipeline.from_pretrained(SD_GEN_CHECKPOINT, torch_dtype=torch.float16)
+            if sd_i2i_pipeline is not None:
+                sd_gen_pipeline = StableDiffusionPipeline.from_pretrained(**sd_i2i_pipeline.components)
+            else:
+                sd_gen_pipeline = StableDiffusionPipeline.from_pretrained(SD_GEN_CHECKPOINT, **sd_kwargs)
             sd_gen_pipeline = sd_gen_pipeline.to("cuda")
+            if DPM_scheduler: sd_gen_pipeline.scheduler = DPMSolverMultistepScheduler.from_config(sd_gen_pipeline.scheduler.config)
+            if attn_slicing: sd_gen_pipeline.enable_attention_slicing()
 
-        text2img = sd_gen_pipeline(prompt=text_prompt, negative_prompt=negative_prompt).images[0]
-        text2img = np.array(text2img)
+        text2img = sd_gen_pipeline(prompt=sd_prompt, negative_prompt=negative_prompt, guidance_scale=guidance_scale, num_inference_steps=num_inference_steps).images[0]
+        # text2img = np.array(text2img)
         return [caption, [(text2img, "Stable Diffusion Generated Image")]]
+
+    if task_type == "Drawing-to-Image":
+        processor = HEDdetector.from_pretrained('lllyasviel/Annotators')
+        scribble = scribble.convert("RGB")
+        control_image = processor(scribble, scribble=True)
+
+        if sd_cn_pipeline is None:
+            controlnet = ControlNetModel.from_pretrained(CONTROLNET_SCRIB_CKP, **sd_kwargs)
+            sd_cn_pipeline = StableDiffusionControlNetPipeline.from_pretrained(
+                SD_CNTRLNET_CKP, controlnet=controlnet, torch_dtype=torch.float16
+            )
+
+            sd_cn_pipeline.scheduler = UniPCMultistepScheduler.from_config(sd_cn_pipeline.scheduler.config)
+            if attn_slicing: sd_cn_pipeline.enable_attention_slicing()
+            sd_cn_pipeline.enable_model_cpu_offload()
+
+        # generator = torch.manual_seed(0)
+        draw_img = sd_cn_pipeline(sd_prompt, image=control_image, guidance_scale=guidance_scale, num_inference_steps=num_inference_steps).images[0]
+        return [caption, [(draw_img, "Stable Diffusion ControlNet Generated Image")]]
+
+    if task_type == "Image-to-Image":
+        if sd_i2i_pipeline is None:
+            if sd_gen_pipeline is not None:
+                sd_i2i_pipeline = StableDiffusionImg2ImgPipeline.from_pretrained(**sd_gen_pipeline.components)
+            else:
+                sd_i2i_pipeline = StableDiffusionImg2ImgPipeline.from_pretrained(SD_I2I_CHECKPOINT, **sd_kwargs)
+            sd_i2i_pipeline = sd_i2i_pipeline.to("cuda")
+            if DPM_scheduler: sd_i2i_pipeline.scheduler = DPMSolverMultistepScheduler.from_config(sd_i2i_pipeline.scheduler.config)
+            if attn_slicing: sd_i2i_pipeline.enable_attention_slicing()
+
+        img2img = sd_i2i_pipeline(prompt=sd_prompt, negative_prompt=negative_prompt, image=image_pil, strength=strength, guidance_scale=guidance_scale, num_inference_steps=num_inference_steps).images[0]
+        # text2img = np.array(text2img)
+        return [caption, [(img2img, "Stable Diffusion Generated Image-to-Image")]]
 
     else:
         print("task_type:{} error!".format(task_type))
@@ -458,6 +544,14 @@ if __name__ == "__main__":
         with gr.Row():
             with gr.Column():
                 input_image = gr.Image(source='upload', type="pil",  tool="sketch")
+
+                with gr.Row():
+                    with gr.Column():
+                        gr.Markdown("Canvas for Drawing-to-Image task -------> ")
+                        gr.Markdown("Click on brush icon to adjust brush size.")
+                    with gr.Column():
+                        create_button = gr.Button(label="Canvas", value="Open Canvas")
+                    
                 gr.Markdown("<h3>Image Caption:</h3>")
                 img_caption = gr.Markdown()
 
@@ -467,18 +561,18 @@ if __name__ == "__main__":
                 
 
             with gr.Column():        
-                task_type = gr.Dropdown(["Image Caption", "Auto SAM Mask", "Detection/Annotation/Segmentation", "Remove/Replace Background", "Inpainting", "Upscale", "Text-to-Image"], value="Detection/Annotation/Segmentation", label="Select Task")
+                task_type = gr.Dropdown(["Image Caption", "Auto SAM Mask", "Detection/Annotation/Segmentation", "Remove/Replace Background", "Inpainting", "Upscale", "Text-to-Image", "Drawing-to-Image", "Image-to-Image"], value="Detection/Annotation/Segmentation", label="Select Task")
                 gr.Markdown("Interaction Mode - Choose one: \n1. Click points on the image | \t2. Provide input text prompt | \t3. No interaction (auto mode)")
-                text_prompt = gr.Textbox(label="Input Text Prompt <For Detection, Inpaint source, Upscale or Text-to-Image")
-                inpaint_prompt = gr.Textbox(label="Inpaint Prompt <Inpaint target. Select Inpainting task>")
-                bg_prompt = gr.Textbox(label="Background Prompt <New SD background. Select Background Remove/Replace task >")
+                text_prompt = gr.Textbox(label="Input Text Prompt <Specify objects to Detect/Segment/Annotate/Inpaint/Separate-Foreground>")
+                sd_prompt = gr.Textbox(label="Stable Diffusion Prompt <Inpaint-target/Upscale/Text-to-image/Drawing-to-Image/Image-to-Image/New-Background>")
+                # bg_prompt = gr.Textbox(label="Background Prompt <New SD background. Select Background Remove/Replace task >")
                 negative_prompt = gr.Textbox(label="Negative Prompt for Stable Diffusion")
                 run_button = gr.Button(label="Run")
 
-                with gr.Accordion("Advanced options", open=False):
+                with gr.Accordion("Advanced Settings", open=False):
                     # with gr.Box():
                     gr.Markdown("Point click Settings")
-                    scribble_mode = gr.Dropdown(["merge", "split"], value="split", label="scribble mode")
+                    scribble_mode = gr.Radio(["merge", "split"], value="split", label="scribble mode")
 
                     gr.Markdown("DINO BBox Settings")
                     box_threshold = gr.Slider(label="box threshold", minimum=0.0, maximum=1.0, value=0.3, step=0.05)
@@ -495,7 +589,12 @@ if __name__ == "__main__":
                     tr_text_threshold = gr.Slider(minimum=0.0, maximum=1.0, step=0.005, value=0.25, label="transparency text threshold")
 
                     gr.Markdown("Inpainting Settings")
-                    inpaint_mode = gr.Dropdown(["merge", "split"], value="merge", label="inpaint mode")
+                    inpaint_mode = gr.Radio(["merge", "split"], value="merge", label="inpaint mode")
+
+                    gr.Markdown("Stable Diffusion Settings")
+                    guidance_scale = gr.Slider(minimum=1, maximum=20, step=0.5, value=7.5, label="Guidance Scale for prompt")
+                    strength = gr.Slider(minimum=0.0, maximum=1.0, step=0.01, value=0.8, label="Noising of reference image")
+                    num_inference_steps = gr.Slider(minimum=1, maximum=60, step=1, value=30, label="Num of Inference Steps")
 
                     gr.Markdown("Model Settings")
                     model_matte = gr.Radio(['ViTMatte (Matte Anything)', 'Matte Anything Model (MAM)'], value='ViTMatte (Matte Anything)', label='Alpha Matte Model')
@@ -503,12 +602,14 @@ if __name__ == "__main__":
                     # openai_api_key= gr.Textbox(label="(Optional)OpenAI key, enable chatgpt")
 
         input_image.upload(
-            clear_old,
-            [],
-            []
-        )
-        run_button.click(fn=run_grounded_sam, inputs=[input_image, task_type, text_prompt, inpaint_prompt, bg_prompt, negative_prompt, scribble_mode, box_threshold, text_threshold, iou_threshold, 
-                                                      erode_kernel_size, dilate_kernel_size, tr_prompt, tr_box_threshold, tr_text_threshold, inpaint_mode, model_matte, model_sam], outputs=[img_caption, gallery])
+            clear_old, [], []
+            )
+        create_button.click(
+            fn=create_canvas, inputs=[], outputs=[input_image]
+            )
+
+        run_button.click(fn=run_grounded_sam, inputs=[input_image, task_type, text_prompt, sd_prompt, negative_prompt, scribble_mode, box_threshold, text_threshold, iou_threshold, 
+                                                      erode_kernel_size, dilate_kernel_size, tr_prompt, tr_box_threshold, tr_text_threshold, inpaint_mode, model_matte, model_sam, guidance_scale, strength, num_inference_steps], outputs=[img_caption, gallery])
 
     block.queue(concurrency_count=100)
     block.launch(server_name='0.0.0.0', server_port=args.port, debug=args.debug, share=args.share)
