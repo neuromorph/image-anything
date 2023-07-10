@@ -47,7 +47,7 @@ TBD:
 
 ###  App Snaps
 Auto SAM Mask: 
-![app screen](assets/first_screen.png) 
+<kbd>![app screen](assets/first_screen.png) </kbd>
 
 Upscale Task and Text to Image Task:
 ![txt2img upscale](assets/ups_t2i.png)  
@@ -76,7 +76,8 @@ Advanced Settings to tune the results:
 ![settings](assets/sett.png) 
 
 ## Acknowledgements
-* [Grounded Segment Anything](https://github.com/IDEA-Research/Grounded-Segment-Anything) (inspiration and helpers)
+This app is built with the help of following models and libraries. Please visit their pages to know more about them.  
+* [Grounded Segment Anything](https://github.com/IDEA-Research/Grounded-Segment-Anything) 
 * [Segment Anything](https://github.com/facebookresearch/segment-anything/)
 * [GroundingDINO](https://github.com/IDEA-Research/GroundingDINO)
 * Stable Diffusion with [Hugging Face diffusers](https://github.com/huggingface/diffusers)
