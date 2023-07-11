@@ -35,11 +35,7 @@ from detectron2.checkpoint import DetectionCheckpointer
 
 # Controlnet Drawing Scribble
 from controlnet_aux import PidiNetDetector, HEDdetector
-from diffusers import (
-    ControlNetModel,
-    StableDiffusionControlNetPipeline,
-    UniPCMultistepScheduler,
-)
+from diffusers import ControlNetModel, StableDiffusionControlNetPipeline, UniPCMultistepScheduler
 
 
 GROUNDING_DINO_CONFIG_PATH = "GroundingDINO/groundingdino/config/GroundingDINO_SwinT_OGC.py"
@@ -51,9 +47,6 @@ SD_UPS_CHECKPOINT = "stabilityai/stable-diffusion-x4-upscaler"
 SD_I2I_CHECKPOINT = "stabilityai/stable-diffusion-2-1-base"
 SD_CNTRLNET_CKP = "runwayml/stable-diffusion-v1-5"
 CONTROLNET_SCRIB_CKP = "lllyasviel/control_v11p_sd15_scribble"
-
-output_dir="outputs"
-device="cuda"
 
 sam_import = {
 	'SAM - Meta': {'sam_model_registry': smr, 'SamPredictor': sp, 'SamAutomaticMaskGenerator': smg},
@@ -89,15 +82,16 @@ sd_cn_pipeline = None
 sd_i2i_pipeline = None
 vitmatte = None
 caption = None
-
+attn_slicing = True # enable_attention_slicing
+dpm_scheduler = True # use DPMSolver Multistep Scheduler
+output_dir="outputs"
+device="cuda"
 sd_kwargs = {
     'torch_dtype':torch.float16,
     # 'safety_checker':None,
     # 'feature_extractor':None,
     # 'requires_safety_checker':False
 }
-attn_slicing = True # enable_attention_slicing
-DPM_scheduler = True # use DPMSolver Multistep Scheduler
 
 
 def show_anns(anns):
@@ -127,7 +121,7 @@ def show_anns(anns):
 
 def generate_caption(processor, blip_model, raw_image):
     # unconditional image captioning
-    inputs = processor(raw_image, return_tensors="pt").to("cuda", torch.float16)
+    inputs = processor(raw_image, return_tensors="pt").to(device, torch.float16)
     out = blip_model.generate(**inputs)
     caption = processor.decode(out[0], skip_special_tokens=True)
     return caption
@@ -198,12 +192,12 @@ def create_canvas():
     return np.zeros(shape=(1000, 1000, 3), dtype=np.uint8) + 255
 
 
-def run_grounded_sam(input_image, task_type, text_prompt, sd_prompt, negative_prompt, scribble_mode, box_threshold, text_threshold, iou_threshold, 
+def run_image_anything(input_image, task_type, text_prompt, sd_prompt, negative_prompt, scribble_mode, box_threshold, text_threshold, iou_threshold, 
                                                       erode_kernel_size, dilate_kernel_size, tr_prompt, tr_box_threshold, tr_text_threshold, inpaint_mode, 
                                                       model_matte, model_sam, guidance_scale, strength, num_inference_steps):
     
     global blip_processor, blip_model, groundingdino_model, sam_predictor, sam_automask_generator, sd_inp_pipeline, sd_gen_pipeline, \
-    sd_ups_pipeline, sd_cn_pipeline, sd_i2i_pipeline, sd_kwargs, attn_slicing, DPM_scheduler, vitmatte, caption
+    sd_ups_pipeline, sd_cn_pipeline, sd_i2i_pipeline, sd_kwargs, attn_slicing, dpm_scheduler, vitmatte, caption, device
 
     torch.cuda.empty_cache()
 
@@ -223,7 +217,7 @@ def run_grounded_sam(input_image, task_type, text_prompt, sd_prompt, negative_pr
         model_type = sam_config[model_sam]
         assert sam_models[model_type], 'SAM checkpoint is not found for the selected SAM model!'
         sam = sam_import[model_sam]['sam_model_registry'][model_type](checkpoint=sam_models[model_type])
-        sam.to(device=device)
+        sam.to(device)
         sam.eval()
         sam_predictor = sam_import[model_sam]['SamPredictor'](sam)
         sam_automask_generator = sam_import[model_sam]['SamAutomaticMaskGenerator'](sam)
@@ -237,7 +231,7 @@ def run_grounded_sam(input_image, task_type, text_prompt, sd_prompt, negative_pr
         if caption is None:
             # generate caption 
             blip_processor = blip_processor or BlipProcessor.from_pretrained("Salesforce/blip-image-captioning-large")
-            blip_model = blip_model or BlipForConditionalGeneration.from_pretrained("Salesforce/blip-image-captioning-large", torch_dtype=torch.float16).to("cuda")
+            blip_model = blip_model or BlipForConditionalGeneration.from_pretrained("Salesforce/blip-image-captioning-large", torch_dtype=torch.float16).to(device)
             caption = generate_caption(blip_processor, blip_model, image_pil)
         return [caption, []]
 
@@ -274,7 +268,7 @@ def run_grounded_sam(input_image, task_type, text_prompt, sd_prompt, negative_pr
         if text_prompt == "" or text_prompt is None:
             if caption == "" or caption is None:
                 blip_processor = blip_processor or BlipProcessor.from_pretrained("Salesforce/blip-image-captioning-large")
-                blip_model = blip_model or BlipForConditionalGeneration.from_pretrained("Salesforce/blip-image-captioning-large", torch_dtype=torch.float16).to("cuda")
+                blip_model = blip_model or BlipForConditionalGeneration.from_pretrained("Salesforce/blip-image-captioning-large", torch_dtype=torch.float16).to(device)
                 caption = generate_caption(blip_processor, blip_model, image_pil)
 
             text_prompt = caption
@@ -304,6 +298,7 @@ def run_grounded_sam(input_image, task_type, text_prompt, sd_prompt, negative_pr
             transformed_boxes = sam_predictor.transform.apply_boxes(detections.xyxy, image.shape[:2])
             transformed_boxes = torch.as_tensor(transformed_boxes, dtype=torch.float).to(device)
 
+        # SAM masks
         masks, _, _ = sam_predictor.predict_torch(
                 point_coords = point_coords,
                 point_labels = point_labels,
@@ -360,8 +355,8 @@ def run_grounded_sam(input_image, task_type, text_prompt, sd_prompt, negative_pr
                 sd_inp_pipeline = StableDiffusionInpaintPipeline.from_pretrained(
                 SD_INP_CHECKPOINT, **sd_kwargs
                 )
-                sd_inp_pipeline = sd_inp_pipeline.to("cuda")
-                if DPM_scheduler: sd_inp_pipeline.scheduler = DPMSolverMultistepScheduler.from_config(sd_inp_pipeline.scheduler.config)
+                sd_inp_pipeline = sd_inp_pipeline.to(device)
+                if dpm_scheduler: sd_inp_pipeline.scheduler = DPMSolverMultistepScheduler.from_config(sd_inp_pipeline.scheduler.config)
                 if attn_slicing: sd_inp_pipeline.enable_attention_slicing()
             
             inp_img = []
@@ -443,8 +438,8 @@ def run_grounded_sam(input_image, task_type, text_prompt, sd_prompt, negative_pr
                     else:
                         sd_gen_pipeline = StableDiffusionPipeline.from_pretrained(SD_GEN_CHECKPOINT, **sd_kwargs)
                 
-                    sd_gen_pipeline = sd_gen_pipeline.to("cuda")
-                    if DPM_scheduler: sd_gen_pipeline.scheduler = DPMSolverMultistepScheduler.from_config(sd_gen_pipeline.scheduler.config)
+                    sd_gen_pipeline = sd_gen_pipeline.to(device)
+                    if dpm_scheduler: sd_gen_pipeline.scheduler = DPMSolverMultistepScheduler.from_config(sd_gen_pipeline.scheduler.config)
                     if attn_slicing: sd_gen_pipeline.enable_attention_slicing()
 
                 background_img = sd_gen_pipeline(prompt = sd_prompt, negative_prompt = negative_prompt,  guidance_scale=guidance_scale, num_inference_steps=num_inference_steps).images[0]
@@ -462,8 +457,8 @@ def run_grounded_sam(input_image, task_type, text_prompt, sd_prompt, negative_pr
             sd_ups_pipeline = StableDiffusionUpscalePipeline.from_pretrained(
                 SD_UPS_CHECKPOINT, revision="fp16", **sd_kwargs
             )
-            sd_ups_pipeline = sd_ups_pipeline.to("cuda")
-            if DPM_scheduler: sd_ups_pipeline.scheduler = DPMSolverMultistepScheduler.from_config(sd_ups_pipeline.scheduler.config)
+            sd_ups_pipeline = sd_ups_pipeline.to(device)
+            if dpm_scheduler: sd_ups_pipeline.scheduler = DPMSolverMultistepScheduler.from_config(sd_ups_pipeline.scheduler.config)
             if attn_slicing: sd_ups_pipeline.enable_attention_slicing()
         
         ups_img = sd_ups_pipeline(prompt=sd_prompt, negative_prompt=negative_prompt, image=image_pil, guidance_scale=guidance_scale, num_inference_steps=num_inference_steps).images[0]
@@ -477,8 +472,8 @@ def run_grounded_sam(input_image, task_type, text_prompt, sd_prompt, negative_pr
                 sd_gen_pipeline = StableDiffusionPipeline.from_pretrained(**sd_i2i_pipeline.components)
             else:
                 sd_gen_pipeline = StableDiffusionPipeline.from_pretrained(SD_GEN_CHECKPOINT, **sd_kwargs)
-            sd_gen_pipeline = sd_gen_pipeline.to("cuda")
-            if DPM_scheduler: sd_gen_pipeline.scheduler = DPMSolverMultistepScheduler.from_config(sd_gen_pipeline.scheduler.config)
+            sd_gen_pipeline = sd_gen_pipeline.to(device)
+            if dpm_scheduler: sd_gen_pipeline.scheduler = DPMSolverMultistepScheduler.from_config(sd_gen_pipeline.scheduler.config)
             if attn_slicing: sd_gen_pipeline.enable_attention_slicing()
 
         text2img = sd_gen_pipeline(prompt=sd_prompt, negative_prompt=negative_prompt, guidance_scale=guidance_scale, num_inference_steps=num_inference_steps).images[0]
@@ -510,8 +505,8 @@ def run_grounded_sam(input_image, task_type, text_prompt, sd_prompt, negative_pr
                 sd_i2i_pipeline = StableDiffusionImg2ImgPipeline.from_pretrained(**sd_gen_pipeline.components)
             else:
                 sd_i2i_pipeline = StableDiffusionImg2ImgPipeline.from_pretrained(SD_I2I_CHECKPOINT, **sd_kwargs)
-            sd_i2i_pipeline = sd_i2i_pipeline.to("cuda")
-            if DPM_scheduler: sd_i2i_pipeline.scheduler = DPMSolverMultistepScheduler.from_config(sd_i2i_pipeline.scheduler.config)
+            sd_i2i_pipeline = sd_i2i_pipeline.to(device)
+            if dpm_scheduler: sd_i2i_pipeline.scheduler = DPMSolverMultistepScheduler.from_config(sd_i2i_pipeline.scheduler.config)
             if attn_slicing: sd_i2i_pipeline.enable_attention_slicing()
 
         img2img = sd_i2i_pipeline(prompt=sd_prompt, negative_prompt=negative_prompt, image=image_pil, strength=strength, guidance_scale=guidance_scale, num_inference_steps=num_inference_steps).images[0]
@@ -525,11 +520,11 @@ def run_grounded_sam(input_image, task_type, text_prompt, sd_prompt, negative_pr
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser("Grounded SAM demo", add_help=True)
-    parser.add_argument("--debug", action="store_true", help="using debug mode")
-    parser.add_argument("--share", action="store_true", help="share the app")
-    parser.add_argument('--port', type=int, default=7589, help='port to run the server')
-    parser.add_argument('--no-gradio-queue', action="store_true", help='no gradio queue')
+    parser = argparse.ArgumentParser("Image Anything", add_help=True)
+    parser.add_argument("--debug", action="store_true", help="use debug mode")
+    parser.add_argument("--share", action="store_true", help="generate gradio share link")
+    parser.add_argument('--port', type=int, default=7589, help="port to run the server")
+    parser.add_argument('--no-gradio-queue', action="store_true", help="no gradio queue")
     args = parser.parse_args()
 
     print(args)
@@ -608,8 +603,10 @@ if __name__ == "__main__":
             fn=create_canvas, inputs=[], outputs=[input_image]
             )
 
-        run_button.click(fn=run_grounded_sam, inputs=[input_image, task_type, text_prompt, sd_prompt, negative_prompt, scribble_mode, box_threshold, text_threshold, iou_threshold, 
-                                                      erode_kernel_size, dilate_kernel_size, tr_prompt, tr_box_threshold, tr_text_threshold, inpaint_mode, model_matte, model_sam, guidance_scale, strength, num_inference_steps], outputs=[img_caption, gallery])
+        inputs=[input_image, task_type, text_prompt, sd_prompt, negative_prompt, scribble_mode, box_threshold, text_threshold, iou_threshold, erode_kernel_size, 
+                dilate_kernel_size, tr_prompt, tr_box_threshold, tr_text_threshold, inpaint_mode, model_matte, model_sam, guidance_scale, strength, num_inference_steps]
+        outputs=[img_caption, gallery]
+        run_button.click(fn=run_image_anything, inputs=inputs, outputs=outputs)
 
     block.queue(concurrency_count=100)
     block.launch(server_name='0.0.0.0', server_port=args.port, debug=args.debug, share=args.share)
